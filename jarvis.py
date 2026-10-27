@@ -17,13 +17,13 @@ VOICE = "en-GB-RyanNeural"
 RATE = "+0%"
 PITCH = "+0Hz"
 
-BASE_URL = "http://localhost:11411/v1"   # to be checked against OmniRoute
-MODEL = "auto"                           # to be checked against OmniRoute
+BASE_URL = "http://localhost:20128/v1"   
+MODEL = "gemini/gemini-3.1-flash-lite"
 API_KEY = "any"
 
 SAMPLE_RATE = 16000
 SPEAK_LEVEL = 1500       # raise if background noise triggers it, lower if it misses you
-SILENCE_SECONDS = 1.2    # how long you pause before Jarvis decides you're done
+SILENCE_SECONDS = 0.8    # how long you pause before Jarvis decides you're done
 MAX_SECONDS = 15
 WAIT_SECONDS = 8         # how long Jarvis waits for you to start talking
 
@@ -33,7 +33,7 @@ SYSTEM_PROMPT = (
     "in plain spoken sentences with no lists, no markdown and no emojis."
 )
 
-client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=30)
 recognizer = sr.Recognizer()
 
 
