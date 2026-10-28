@@ -44,6 +44,7 @@ WAIT_SECONDS = 8
 
 MAX_TOKENS = 450        # caps reply length (room for a code example)
 KEEP_MESSAGES = 11      # recent messages sent to the brain (shorter = faster)
+CLIPBOARD_LIMIT = 6000  # max characters of clipboard text sent to the brain
 
 DATA_FILE = "schedule.json"
 
@@ -60,7 +61,10 @@ BASE_PROMPT = (
     "stop loss and position size, point out risk and any pattern in their logged trades, and politely "
     "challenge weak reasoning instead of just agreeing. You have no live market data, so never quote prices "
     "or predict the market, never tell them to buy or sell, and occasionally remind them you are not a "
-    "financial advisor. Use only the trade journal figures below for recaps; never invent trades or numbers."
+    "financial advisor. Use only the trade journal figures below for recaps; never invent trades or numbers. "
+    "If the user's message includes clipboard contents, treat them as the code or error they want help with: "
+    "say in simple words what it means, the likely cause, and how to fix it, and put any corrected code "
+    "in a code tag so it appears on screen."
 )
 
 ACTIONS = (
@@ -248,6 +252,20 @@ def build_system_prompt():
         f"{BASE_PROMPT}\n\n{ACTIONS}\n\n"
         f"Current date and time: {now}.\nOpen tasks: {tasks}.\nPending reminders: {rems}.\nTrade journal: {journal}."
     )
+
+
+# ---------- Clipboard ----------
+def read_clipboard():
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        try:
+            return root.clipboard_get().strip()
+        finally:
+            root.destroy()
+    except Exception:
+        return ""
 
 
 # ---------- Voice ----------
@@ -448,6 +466,13 @@ while True:
         speak("Goodbye sir.")
         break
 
+    if re.search(r"clip\s?board", user, re.I):
+        clip = read_clipboard()
+        if not clip:
+            speak("Your clipboard is empty, sir.")
+            continue
+        print(f"[Clipboard] read {len(clip)} characters")
+        user = f"{user}\n\nClipboard contents:\n{clip[:CLIPBOARD_LIMIT]}"
     history.append({"role": "user", "content": user})
     if len(history) > KEEP_MESSAGES + 1:
         del history[1:len(history) - KEEP_MESSAGES]
