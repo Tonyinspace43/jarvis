@@ -55,7 +55,12 @@ BASE_PROMPT = (
     "Explain one idea at a time in plain words with a simple everyday analogy, in a few sentences, "
     "and never read code aloud symbol by symbol. If a short example would help, put it at the very end "
     "inside a code tag so it appears on screen instead of being spoken, and say something brief like "
-    "'I've put an example on your screen, sir.' Finish with a small thing for them to try or a quick question."
+    "'I've put an example on your screen, sir.' Finish with a small thing for them to try or a quick question. "
+    "When the user talks about trading, act as a calm, candid sounding board: ask about their reason, "
+    "stop loss and position size, point out risk and any pattern in their logged trades, and politely "
+    "challenge weak reasoning instead of just agreeing. You have no live market data, so never quote prices "
+    "or predict the market, never tell them to buy or sell, and occasionally remind them you are not a "
+    "financial advisor. Use only the trade journal figures below for recaps; never invent trades or numbers."
 )
 
 ACTIONS = (
@@ -67,6 +72,10 @@ ACTIONS = (
     "- Task finished: <<done|a few words from the task>>\n"
     "- Cancel a reminder: <<cancel|a few words from the reminder>>\n"
     "- Show code on screen: <<code|the code>> (coding help only; it is displayed, never spoken)\n"
+    "- Log a new trade: <<trade|symbol|buy or sell|entry price|stop loss|target|reason>> "
+    "(leave a field empty if the user did not say it)\n"
+    "- Close a trade: <<tradeclose|symbol|exit price|profit or loss as a plain number, negative for a loss|short lesson>>\n"
+    "- Show the trade journal on screen: <<showtrades|>>\n"
     "Never read the tags aloud or mention them. Confirm in one short spoken sentence. "
     "When asked what is on their list or schedule, answer from the lists below."
 )
@@ -107,7 +116,68 @@ def save_data(d):
 
 data = load_data()
 
-TAG = re.compile(r"<<(task|remind|done|cancel|code)\|(.*?)>>", re.S)
+# ---------- Trade journal ----------
+TRADES_FILE = "trades.json"
+
+
+def load_trades():
+    try:
+        with open(TRADES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_trades(t):
+    with open(TRADES_FILE, "w", encoding="utf-8") as f:
+        json.dump(t, f, indent=2)
+
+
+def to_number(text):
+    try:
+        return float(re.sub(r"[^0-9.\-]", "", text))
+    except ValueError:
+        return None
+
+
+def describe_trade(t):
+    line = f'{t["symbol"]} {t["side"]} @ {t["entry"] or "?"}'
+    if t["stop"]:
+        line += f' stop {t["stop"]}'
+    if t["target"]:
+        line += f' target {t["target"]}'
+    if t["status"] == "closed":
+        line += f' | closed @ {t["exit"] or "?"}'
+        if t["pnl"] is not None:
+            line += f' P/L {t["pnl"]:+g}'
+        if t["lesson"]:
+            line += f' | lesson: {t["lesson"]}'
+    else:
+        line += " | open"
+    if t["reason"]:
+        line += f' | reason: {t["reason"]}'
+    return line
+
+
+def trade_summary():
+    if not trades:
+        return "no trades logged yet"
+    open_t = [t for t in trades if t["status"] == "open"]
+    closed = [t for t in trades if t["status"] == "closed"]
+    pnls = [t["pnl"] for t in closed if t["pnl"] is not None]
+    wins = sum(1 for p in pnls if p > 0)
+    losses = sum(1 for p in pnls if p < 0)
+    out = [f"{len(open_t)} open, {len(closed)} closed ({wins} wins, {losses} losses, total P/L {sum(pnls):+g})"]
+    if open_t:
+        out.append("Open: " + "; ".join(describe_trade(t) for t in open_t))
+    if closed:
+        out.append("Recent closed: " + "; ".join(describe_trade(t) for t in closed[-5:]))
+    return ". ".join(out)
+
+
+trades = load_trades()
+
+TAG = re.compile(r"<<(tradeclose|trade|showtrades|task|remind|done|cancel|code)\|(.*?)>>", re.S)
 
 
 def apply_actions(reply):
@@ -117,6 +187,34 @@ def apply_actions(reply):
             if kind == "code":
                 code = re.sub(r"^```\w*\n?|```$", "", body.strip()).strip()
                 print("\n----- code -----\n" + code + "\n----------------")
+            elif kind == "trade" and parts[0]:
+                f = (parts + [""] * 6)[:6]
+                trades.append({
+                    "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "symbol": f[0].upper(), "side": f[1].lower(), "entry": f[2], "stop": f[3],
+                    "target": f[4], "reason": f[5], "status": "open",
+                    "exit": "", "pnl": None, "lesson": "",
+                })
+            elif kind == "tradeclose" and parts[0]:
+                f = (parts + [""] * 4)[:4]
+                sym = f[0].upper()
+                for t in reversed(trades):
+                    if t["status"] == "open" and (sym in t["symbol"] or t["symbol"] in sym):
+                        t["status"] = "closed"
+                        t["exit"] = f[1]
+                        t["pnl"] = to_number(f[2])
+                        t["lesson"] = f[3]
+                        break
+                else:
+                    print(f"\n[Journal] No open trade found for {sym}, so nothing was closed.")
+            elif kind == "showtrades":
+                shown = trades[-20:]
+                print("\n----- trade journal -----")
+                if not shown:
+                    print("No trades logged yet.")
+                for i, t in enumerate(shown, len(trades) - len(shown) + 1):
+                    print(f"{i}. {describe_trade(t)}")
+                print("-------------------------")
             elif kind == "task" and parts[0]:
                 data["tasks"].append({"text": parts[0], "done": False})
             elif kind == "remind" and len(parts) >= 2:
@@ -136,6 +234,7 @@ def apply_actions(reply):
                         r["fired"] = True
                         break
         save_data(data)
+        save_trades(trades)
     return TAG.sub("", reply).strip()
 
 
@@ -144,9 +243,10 @@ def build_system_prompt():
     with data_lock:
         tasks = "; ".join(t["text"] for t in data["tasks"] if not t["done"]) or "none"
         rems = "; ".join(f'{r["time"]} {r["text"]}' for r in data["reminders"] if not r["fired"]) or "none"
+        journal = trade_summary()
     return (
         f"{BASE_PROMPT}\n\n{ACTIONS}\n\n"
-        f"Current date and time: {now}.\nOpen tasks: {tasks}.\nPending reminders: {rems}."
+        f"Current date and time: {now}.\nOpen tasks: {tasks}.\nPending reminders: {rems}.\nTrade journal: {journal}."
     )
 
 
