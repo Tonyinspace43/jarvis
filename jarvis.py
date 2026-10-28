@@ -3,10 +3,14 @@ os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 
 import asyncio
 import datetime
+import itertools
 import json
+import queue
 import re
+import tempfile
 import threading
 import time
+import urllib.request
 
 import edge_tts
 import numpy as np
@@ -14,6 +18,8 @@ import pygame
 import sounddevice as sd
 import speech_recognition as sr
 from openai import OpenAI
+
+
 
 # ---------- Settings ----------
 VOICE = "en-GB-RyanNeural"
@@ -24,11 +30,20 @@ BASE_URL = "http://localhost:20128/v1"
 MODEL = "gemini/gemini-3.1-flash-lite"
 API_KEY = "any"
 
+# Your private ntfy topic: must match what you subscribed to in the ntfy app
+NTFY_TOPIC = "jarvis-tony-x7k29q"
+
+# True = always listening, no Enter key needed. False = press Enter / type.
+HANDS_FREE = True
+
 SAMPLE_RATE = 16000
 SPEAK_LEVEL = 1500
-SILENCE_SECONDS = 0.8
+SILENCE_SECONDS = 0.5   # how long you pause before he decides you're done (lower = faster)
 MAX_SECONDS = 15
 WAIT_SECONDS = 8
+
+MAX_TOKENS = 250        # caps reply length so he never rambles
+KEEP_MESSAGES = 11      # recent messages sent to the brain (shorter = faster)
 
 DATA_FILE = "schedule.json"
 
@@ -54,6 +69,20 @@ client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=30)
 recognizer = sr.Recognizer()
 speak_lock = threading.Lock()
 data_lock = threading.Lock()
+
+
+# ---------- Phone alerts (ntfy) ----------
+def send_alert(message, title="Jarvis"):
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=message.encode("utf-8"),
+            headers={"Title": title, "Priority": "high"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print("ntfy failed:", e)
 
 
 # ---------- Saved schedule ----------
@@ -113,22 +142,72 @@ def build_system_prompt():
 
 
 # ---------- Voice ----------
-def speak(text):
-    text = re.sub(r"[*_`#]", "", text).strip()
-    if not text:
-        return
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+_audio_ids = itertools.count()
+
+
+def clean_for_speech(text):
+    return re.sub(r"[*_`#<>]", "", text).strip()
+
+
+def speak_queue(q):
+    """Speak sentences from q (None = finished). While one sentence is playing,
+    the next one is already being turned into audio."""
+    audio_q = queue.Queue()
+
+    def synth():
+        try:
+            while True:
+                s = q.get()
+                if s is None:
+                    break
+                s = clean_for_speech(s)
+                if not s:
+                    continue
+                path = os.path.join(tempfile.gettempdir(), f"jarvis_{next(_audio_ids)}.mp3")
+                try:
+                    asyncio.run(edge_tts.Communicate(s, VOICE, rate=RATE, pitch=PITCH).save(path))
+                    audio_q.put(path)
+                except Exception as e:
+                    print("Voice error:", e)
+        finally:
+            audio_q.put(None)
+
+    worker = threading.Thread(target=synth, daemon=True)
+    worker.start()
     with speak_lock:
-        asyncio.run(edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH).save("reply.mp3"))
         pygame.mixer.init()
-        pygame.mixer.music.load("reply.mp3")
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy():
-            pygame.time.wait(100)
-        pygame.mixer.music.unload()
-        pygame.mixer.quit()
+        try:
+            while True:
+                path = audio_q.get()
+                if path is None:
+                    break
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    pygame.time.wait(50)
+                pygame.mixer.music.unload()
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        finally:
+            pygame.mixer.quit()
+    worker.join()
 
 
-def listen():
+def speak(text):
+    sentences = [s for s in SENTENCE_END.split(text.strip()) if s.strip()]
+    if not sentences:
+        return
+    q = queue.Queue()
+    for s in sentences:
+        q.put(s)
+    q.put(None)
+    speak_queue(q)
+
+
+def listen(wait=WAIT_SECONDS):
     chunks, started, quiet, waited = [], False, 0, 0
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16") as stream:
         while True:
@@ -139,7 +218,7 @@ def listen():
                 if level > SPEAK_LEVEL:
                     started = True
                     chunks.append(audio_chunk)
-                elif waited > WAIT_SECONDS * 10:
+                elif waited > wait * 10:
                     return ""
             else:
                 chunks.append(audio_chunk)
@@ -157,14 +236,53 @@ def listen():
 
 
 # ---------- Brain ----------
-def ask(history):
+def ask_and_speak(history):
+    """Streams the reply and starts speaking as soon as the first sentence is ready.
+    Returns (full_raw_reply, spoke_anything), or (None, False) if the brain failed."""
     history[0]["content"] = build_system_prompt()
     try:
-        reply = client.chat.completions.create(model=MODEL, messages=history)
-        return reply.choices[0].message.content
+        stream = client.chat.completions.create(
+            model=MODEL, messages=history, stream=True, max_tokens=MAX_TOKENS
+        )
     except Exception as e:
         print("Brain error:", e)
-        return None
+        return None, False
+
+    q = queue.Queue()
+    player = threading.Thread(target=speak_queue, args=(q,))
+    player.start()
+
+    raw, buf, in_tag, spoke = "", "", False, False
+    try:
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content or ""
+            raw += delta
+            if in_tag or not delta:
+                continue
+            buf += delta
+            if "<<" in buf:              # action tags are never spoken
+                buf = buf.split("<<")[0]
+                in_tag = True
+            parts = SENTENCE_END.split(buf)
+            for s in parts[:-1]:
+                if s.strip():
+                    q.put(s)
+                    spoke = True
+            buf = parts[-1]
+        if buf.strip():
+            q.put(buf)
+            spoke = True
+    except Exception as e:
+        print("Brain error:", e)
+    finally:
+        q.put(None)
+    player.join()
+
+    if not raw.strip():
+        return None, False
+    return raw, spoke
 
 
 # ---------- Reminders ----------
@@ -182,6 +300,7 @@ def reminder_loop():
                 save_data(data)
         for text in due:
             print(f"\n[Reminder] {text}")
+            send_alert(f"Reminder: {text}")
             speak(f"Excuse me sir, a reminder: {text}")
 
 
@@ -193,32 +312,43 @@ part = "morning" if hour < 12 else "afternoon" if hour < 18 else "evening"
 history = [{"role": "system", "content": build_system_prompt()}]
 
 speak(f"Good {part} sir. All systems are online.")
+if HANDS_FREE:
+    print("\nHands-free on. Just talk. Say 'goodbye Jarvis' to quit, or press Ctrl+C.")
 
 while True:
-    typed = input("\nPress Enter to speak, or type a message (quit to exit): ").strip()
-    if typed.lower() in ("quit", "exit"):
-        break
-    if typed:
-        user = typed
-    else:
-        print("Listening...")
+    if HANDS_FREE:
         user = listen()
         if not user:
-            print("Didn't catch that.")
             continue
         print("You:", user)
+    else:
+        typed = input("\nPress Enter to speak, or type a message (quit to exit): ").strip()
+        if typed.lower() in ("quit", "exit"):
+            break
+        if typed:
+            user = typed
+        else:
+            print("Listening...")
+            user = listen()
+            if not user:
+                print("Didn't catch that.")
+                continue
+            print("You:", user)
 
     if user.lower().strip(" .!") in ("quit", "exit", "goodbye jarvis"):
         speak("Goodbye sir.")
         break
 
     history.append({"role": "user", "content": user})
-    raw = ask(history)
+    if len(history) > KEEP_MESSAGES + 1:
+        del history[1:len(history) - KEEP_MESSAGES]
+    raw, spoke = ask_and_speak(history)
     if raw is None:
         history.pop()
         speak("I can't reach my brain right now, sir.")
         continue
     history.append({"role": "assistant", "content": raw})
-    text = apply_actions(raw) or "Done, sir."
-    print("Jarvis:", text)
-    speak(text)
+    text = apply_actions(raw)
+    print("Jarvis:", text or "Done, sir.")
+    if not spoke:
+        speak(text or "Done, sir.")
