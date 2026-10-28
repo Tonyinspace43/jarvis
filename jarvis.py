@@ -42,7 +42,7 @@ SILENCE_SECONDS = 0.5   # how long you pause before he decides you're done (lowe
 MAX_SECONDS = 15
 WAIT_SECONDS = 8
 
-MAX_TOKENS = 250        # caps reply length so he never rambles
+MAX_TOKENS = 450        # caps reply length (room for a code example)
 KEEP_MESSAGES = 11      # recent messages sent to the brain (shorter = faster)
 
 DATA_FILE = "schedule.json"
@@ -50,7 +50,12 @@ DATA_FILE = "schedule.json"
 BASE_PROMPT = (
     "You are Jarvis, a calm, composed and confident British assistant and confidant. "
     "Always address the user as 'sir'. Keep replies short,funny, sarcastic and conversational, "
-    "in plain spoken sentences with no lists, no markdown and no emojis."
+    "in plain spoken sentences with no lists, no markdown and no emojis. "
+    "When the user asks about coding, become a patient tutor for a beginner who is learning to code. "
+    "Explain one idea at a time in plain words with a simple everyday analogy, in a few sentences, "
+    "and never read code aloud symbol by symbol. If a short example would help, put it at the very end "
+    "inside a code tag so it appears on screen instead of being spoken, and say something brief like "
+    "'I've put an example on your screen, sir.' Finish with a small thing for them to try or a quick question."
 )
 
 ACTIONS = (
@@ -61,6 +66,7 @@ ACTIONS = (
     "(work out the exact date and time from the current time given below, using 24-hour time)\n"
     "- Task finished: <<done|a few words from the task>>\n"
     "- Cancel a reminder: <<cancel|a few words from the reminder>>\n"
+    "- Show code on screen: <<code|the code>> (coding help only; it is displayed, never spoken)\n"
     "Never read the tags aloud or mention them. Confirm in one short spoken sentence. "
     "When asked what is on their list or schedule, answer from the lists below."
 )
@@ -101,14 +107,17 @@ def save_data(d):
 
 data = load_data()
 
-TAG = re.compile(r"<<(task|remind|done|cancel)\|(.*?)>>", re.S)
+TAG = re.compile(r"<<(task|remind|done|cancel|code)\|(.*?)>>", re.S)
 
 
 def apply_actions(reply):
     with data_lock:
         for kind, body in TAG.findall(reply):
             parts = [p.strip() for p in body.split("|")]
-            if kind == "task" and parts[0]:
+            if kind == "code":
+                code = re.sub(r"^```\w*\n?|```$", "", body.strip()).strip()
+                print("\n----- code -----\n" + code + "\n----------------")
+            elif kind == "task" and parts[0]:
                 data["tasks"].append({"text": parts[0], "done": False})
             elif kind == "remind" and len(parts) >= 2:
                 try:
