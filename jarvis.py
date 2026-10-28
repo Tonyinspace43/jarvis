@@ -64,7 +64,14 @@ BASE_PROMPT = (
     "financial advisor. Use only the trade journal figures below for recaps; never invent trades or numbers. "
     "If the user's message includes clipboard contents, treat them as the code or error they want help with: "
     "say in simple words what it means, the likely cause, and how to fix it, and put any corrected code "
-    "in a code tag so it appears on screen."
+    "in a code tag so it appears on screen. "
+    "When the user asks about veterinary medicine, which is the course they are studying, act as a patient, "
+    "knowledgeable study partner: explain topics such as anatomy, physiology, pharmacology, pathology, nutrition, "
+    "animal handling and clinical reasoning in plain spoken words with simple analogies, one idea at a time. "
+    "When asked to quiz them, ask one question at a time, wait for the answer, then say whether it was right and "
+    "explain briefly. You are a study aid, not a vet: for drug doses or treatments, tell them to confirm against "
+    "their course notes or formulary, and if a real animal seems unwell, tell them to contact a vet in person. "
+    "Use the notes about the user below naturally, and never claim to know anything about them that is not in those notes."
 )
 
 ACTIONS = (
@@ -80,6 +87,10 @@ ACTIONS = (
     "(leave a field empty if the user did not say it)\n"
     "- Close a trade: <<tradeclose|symbol|exit price|profit or loss as a plain number, negative for a loss|short lesson>>\n"
     "- Show the trade journal on screen: <<showtrades|>>\n"
+    "- Remember a lasting fact: <<note|the fact>> (only when the user asks you to remember something, or shares "
+    "something lasting about their course, modules, exams, schedule, goals or weak topics)\n"
+    "- Forget a note: <<forget|a few words from the note>>\n"
+    "- Show everything you remember on screen: <<shownotes|>>\n"
     "Never read the tags aloud or mention them. Confirm in one short spoken sentence. "
     "When asked what is on their list or schedule, answer from the lists below."
 )
@@ -181,7 +192,27 @@ def trade_summary():
 
 trades = load_trades()
 
-TAG = re.compile(r"<<(tradeclose|trade|showtrades|task|remind|done|cancel|code)\|(.*?)>>", re.S)
+
+# ---------- Notes about the user ----------
+NOTES_FILE = "notes.json"
+
+
+def load_notes():
+    try:
+        with open(NOTES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_notes(n):
+    with open(NOTES_FILE, "w", encoding="utf-8") as f:
+        json.dump(n, f, indent=2)
+
+
+notes = load_notes()
+
+TAG = re.compile(r"<<(tradeclose|trade|showtrades|shownotes|note|forget|task|remind|done|cancel|code)\|(.*?)>>", re.S)
 
 
 def apply_actions(reply):
@@ -219,6 +250,25 @@ def apply_actions(reply):
                 for i, t in enumerate(shown, len(trades) - len(shown) + 1):
                     print(f"{i}. {describe_trade(t)}")
                 print("-------------------------")
+            elif kind == "note" and body.strip():
+                fact = body.strip()
+                if fact.lower() not in [n.lower() for n in notes]:
+                    notes.append(fact)
+            elif kind == "forget" and body.strip():
+                key = body.strip().lower()
+                for n in notes:
+                    if key in n.lower():
+                        notes.remove(n)
+                        break
+                else:
+                    print(f"\n[Notes] Nothing matching '{body.strip()}' to forget.")
+            elif kind == "shownotes":
+                print("\n----- what Jarvis knows -----")
+                if not notes:
+                    print("Nothing saved yet.")
+                for i, n in enumerate(notes, 1):
+                    print(f"{i}. {n}")
+                print("-----------------------------")
             elif kind == "task" and parts[0]:
                 data["tasks"].append({"text": parts[0], "done": False})
             elif kind == "remind" and len(parts) >= 2:
@@ -239,6 +289,7 @@ def apply_actions(reply):
                         break
         save_data(data)
         save_trades(trades)
+        save_notes(notes)
     return TAG.sub("", reply).strip()
 
 
@@ -248,9 +299,10 @@ def build_system_prompt():
         tasks = "; ".join(t["text"] for t in data["tasks"] if not t["done"]) or "none"
         rems = "; ".join(f'{r["time"]} {r["text"]}' for r in data["reminders"] if not r["fired"]) or "none"
         journal = trade_summary()
+        known = "; ".join(notes[-60:]) or "nothing yet"
     return (
         f"{BASE_PROMPT}\n\n{ACTIONS}\n\n"
-        f"Current date and time: {now}.\nOpen tasks: {tasks}.\nPending reminders: {rems}.\nTrade journal: {journal}."
+        f"Current date and time: {now}.\nOpen tasks: {tasks}.\nPending reminders: {rems}.\nTrade journal: {journal}.\nNotes about the user: {known}."
     )
 
 
