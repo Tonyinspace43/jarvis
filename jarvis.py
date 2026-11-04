@@ -59,7 +59,11 @@ NTFY_TOPIC = "jarvis-tony-x7k29q"
 HANDS_FREE = True
 
 SAMPLE_RATE = 16000
-SPEAK_LEVEL = 1500
+SPEAK_LEVEL = 700      # fixed trigger level, used only if AUTO_LEVEL is False
+AUTO_LEVEL = True       # measures your room's background noise at startup and sets the trigger for you
+MIN_LEVEL = 300         # the trigger never goes below this
+MAX_LEVEL = 2000        # ...or above this
+DEBUG_MIC = True        # prints what the mic picks up; set False once he hears you reliably
 SILENCE_SECONDS = 0.5   # how long you pause before he decides you're done (lower = faster)
 MAX_SECONDS = 15
 WAIT_SECONDS = 8
@@ -514,22 +518,45 @@ def speak(text):
     speak_queue(q)
 
 
+trigger_level = SPEAK_LEVEL
+
+
+def calibrate_mic(seconds=2):
+    """Listens to the room for a moment and sets the trigger level just above the background noise."""
+    global trigger_level
+    try:
+        peaks = []
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16") as stream:
+            for _ in range(seconds * 10):
+                chunk, _ = stream.read(1600)
+                peaks.append(int(np.abs(chunk).max()))
+        peaks.sort()
+        noise = peaks[len(peaks) // 2]      # the typical background level (median)
+        trigger_level = max(MIN_LEVEL, min(MAX_LEVEL, noise * 3))
+        print(f"[mic] background noise {noise}, trigger level set to {trigger_level}")
+    except Exception as e:
+        print("[mic] couldn't calibrate, using the fixed level:", e)
+
+
 def listen(wait=WAIT_SECONDS):
-    chunks, started, quiet, waited = [], False, 0, 0
+    chunks, started, quiet, waited, peak = [], False, 0, 0, 0
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16") as stream:
         while True:
             audio_chunk, _ = stream.read(1600)
             level = int(np.abs(audio_chunk).max())
             if not started:
                 waited += 1
-                if level > SPEAK_LEVEL:
+                peak = max(peak, level)
+                if level > trigger_level:
                     started = True
                     chunks.append(audio_chunk)
                 elif waited > wait * 10:
+                    if DEBUG_MIC:
+                        print(f"   [mic] nothing heard: loudest level {peak}, trigger {trigger_level}", flush=True)
                     return ""
             else:
                 chunks.append(audio_chunk)
-                quiet = quiet + 1 if level < SPEAK_LEVEL else 0
+                quiet = quiet + 1 if level < trigger_level else 0
                 if quiet > SILENCE_SECONDS * 10 or len(chunks) > MAX_SECONDS * 10:
                     break
     audio = np.concatenate(chunks)
@@ -537,6 +564,8 @@ def listen(wait=WAIT_SECONDS):
     try:
         return recognizer.recognize_google(sr.AudioData(audio.tobytes(), SAMPLE_RATE, 2))
     except sr.UnknownValueError:
+        if DEBUG_MIC:
+            print("   [mic] heard sound but couldn't make out any words", flush=True)
         return ""
     except sr.RequestError as e:
         print("Speech service error:", e)
@@ -701,6 +730,9 @@ part = "morning" if hour < 12 else "afternoon" if hour < 18 else "evening"
 history = [{"role": "system", "content": build_system_prompt()}]
 
 speak(f"Good {part} sir. All systems are online.")
+if AUTO_LEVEL:
+    print("[mic] calibrating, stay quiet for 2 seconds...")
+    calibrate_mic()
 if HANDS_FREE:
     print("\nHands-free on. Just talk, or type a message and press Enter. "
           "Say or type 'goodbye Jarvis' to quit.")
